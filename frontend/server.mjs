@@ -1,7 +1,8 @@
 /**
  * Demo frontend (Node / Express). Serves a tiny page and the status contract.
- *   GET /api/status -> { service, version }   (version = deployed SHA)
- *   GET /          -> a page that fetches the backend greeting
+ *   GET /api/status        -> { service, version }   (version = deployed SHA)
+ *   GET /                  -> a page that fetches the backend greeting
+ *   POST /api/client-events -> browser outcome beacon, forwarded to LaunchDarkly
  *
  * The backend-status line on the page is gated by the string multivariate flag
  * "enable-backend-status": "control" renders the page exactly as before, "v1"
@@ -41,6 +42,35 @@ export function flagVariation(ldClient, key, context = ldContext()) {
   }
 }
 
+/** Emit a custom event. A telemetry failure must never fail the request. */
+function track(ldClient, eventKey, context, metricValue) {
+  if (!ldClient) return;
+  try {
+    ldClient.track(eventKey, context, undefined, metricValue);
+  } catch (err) {
+    console.warn(`track failed for ${eventKey}: ${err.message}`);
+  }
+}
+
+/**
+ * Parse a `navigator.sendBeacon` body. The browser posts a Blob with whatever
+ * content type it likes, so the body arrives as raw text and may be malformed
+ * or empty. Returns the recognized outcome, or null to drop the report —
+ * an unrecognized payload must never be counted as either arm of a metric.
+ */
+export function parseClientEvent(raw) {
+  if (typeof raw !== "string" || raw.length === 0) return null;
+  let parsed;
+  try {
+    parsed = JSON.parse(raw);
+  } catch {
+    return null;
+  }
+  if (parsed === null || typeof parsed !== "object") return null;
+  if (parsed.outcome !== "ok" && parsed.outcome !== "error") return null;
+  return { outcome: parsed.outcome };
+}
+
 function renderPage({ showBackendStatus }) {
   const bodyLines = [
     `  <h1>LaunchDarkly Auto-Factory — Demo</h1>`,
@@ -58,11 +88,16 @@ function renderPage({ showBackendStatus }) {
   if (showBackendStatus) {
     bodyLines.push(`  <p id="backend-status">Checking backend status…</p>`);
     scriptLines.push(
+      `    function reportBackendStatus(outcome) {`,
+      `      try { navigator.sendBeacon("/api/client-events", JSON.stringify({ outcome: outcome })); } catch (e) {}`,
+      `    }`,
       `    fetch("${BACKEND_URL}/api/status")`,
       `      .then(r => r.json())`,
       `      .then(d => { document.getElementById("backend-status").textContent =`,
-      `        "Backend online: " + d.service + " version " + d.version; })`,
-      `      .catch(() => { document.getElementById("backend-status").textContent = "Backend offline"; });`,
+      `        "Backend online: " + d.service + " version " + d.version;`,
+      `        reportBackendStatus("ok"); })`,
+      `      .catch(() => { document.getElementById("backend-status").textContent = "Backend offline";`,
+      `        reportBackendStatus("error"); });`,
     );
   }
 
@@ -86,10 +121,40 @@ export function createApp({ ldClient = null } = {}) {
   });
 
   app.get("/", (_req, res) => {
+    const startedAt = performance.now();
+    const context = ldContext();
     const showBackendStatus =
-      flagVariation(ldClient, BACKEND_STATUS_FLAG) === "v1";
+      flagVariation(ldClient, BACKEND_STATUS_FLAG, context) === "v1";
+
     res.type("html").send(renderPage({ showBackendStatus }));
+
+    // Emitted on BOTH variations so the guarded release has a real two-armed
+    // latency comparison rather than a one-armed treatment-only sample.
+    track(
+      ldClient,
+      "enable-backend-status-latency",
+      context,
+      performance.now() - startedAt,
+    );
   });
+
+  // Outcome beacon for the v1 status check, which runs in the browser where the
+  // Node server SDK cannot observe it. The control page never posts here.
+  app.post(
+    "/api/client-events",
+    express.text({ type: "*/*", limit: "1kb" }),
+    (req, res) => {
+      res.status(204).end();
+      const event = parseClientEvent(req.body);
+      if (!event) return;
+      const context = ldContext();
+      if (event.outcome === "ok") {
+        track(ldClient, "enable-backend-status-success", context);
+      } else {
+        track(ldClient, "enable-backend-status-error", context);
+      }
+    },
+  );
 
   return app;
 }
@@ -107,7 +172,9 @@ export async function initLdClient() {
   }
 }
 
-if (import.meta.url === pathToFileURL(process.argv[1]).href) {
+const entryPoint = process.argv[1] ? pathToFileURL(process.argv[1]).href : null;
+
+if (import.meta.url === entryPoint) {
   const ldClient = await initLdClient();
   const port = process.env.PORT || 3000;
   createApp({ ldClient }).listen(port, () =>
